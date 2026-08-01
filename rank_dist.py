@@ -231,7 +231,6 @@ def run_small_test3():
     print(result)
     print(torch.exp(result))
 
-
 def run_small_test4():
     device = 'cpu'
     score_probabilities = torch.from_numpy(np.array([[0.45, 0.55],

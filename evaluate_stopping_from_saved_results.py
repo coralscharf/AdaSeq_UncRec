@@ -2,9 +2,11 @@ import argparse
 import ast
 import copy
 import os
+import time
 
 os.environ["TQDM_DISABLE"] = "1"
 
+from SASRecScoreDist.train_and_export import generate_score_distributions, load_exported_rating_head
 from ranking_task import *
 
 
@@ -31,7 +33,8 @@ def load_candidate_items_per_user(experiment_dir):
     return candidate_items_per_user
 
 
-def build_base_user_ranking_task(user_id, data, first_stage_model, score_distribution_type,
+def build_base_user_ranking_task(user_id, data, first_stage_model, first_stage_model_name,
+                                 sasrec_model_outputs, sasrec_rating_head, score_distribution_type,
                                  score_values, dataset_raw_score_values, truncate_continuous_distribution,
                                  prob_over_scores, candidate_items_per_user, add_prob_to_score, top_k_max_size):
     user_id_tensor = torch.tensor(user_id).to(device)
@@ -39,14 +42,25 @@ def build_base_user_ranking_task(user_id, data, first_stage_model, score_distrib
     train_val_item_ids = list(data.train_val.item[data.train_val.user == user_id])
     user_test_data = data.test[data.test[:, 0] == user_id][:, 1::]
 
-    rec_items_by_preds = first_stage_model.recommend(user_id_tensor,
-                                                     remove_items=np.array(train_val_item_ids),
-                                                     n=data.n_item - len(train_val_item_ids))
+    if first_stage_model_name == "SASRecDist":
+        rec_items_by_preds = None
+    else:
+        rec_items_by_preds = first_stage_model.recommend(user_id_tensor,
+                                                         remove_items=np.array(train_val_item_ids),
+                                                         n=data.n_item - len(train_val_item_ids))
 
     if score_distribution_type == "discrete":
-        item_score_distributions = (
-            first_stage_model.predict_items_distribution_for_user(user_id_tensor).to(device)
-        )
+        if first_stage_model_name == "SASRecDist":
+            all_item_ids = np.arange(data.n_item, dtype=np.int64)
+            item_score_distributions = generate_score_distributions(sasrec_model_outputs,
+                                                                    sasrec_rating_head,
+                                                                    user_id, all_item_ids,
+                                                                    device)
+        else:
+            item_score_distributions = (
+                first_stage_model.predict_items_distribution_for_user(user_id_tensor).to(device)
+            )
+
         user_ranking_task = UserRankingTask(user_id, train_val_item_ids, user_test_data,
                                             rec_items_by_preds, item_score_distributions,
                                             score_values, top_k_max_size)
@@ -77,22 +91,46 @@ def build_base_user_ranking_task(user_id, data, first_stage_model, score_distrib
 
 
 def run_stopping_from_saved_results(seed=0, dataset="ml-25m", first_stage_model_name="CPMF",
+                                    sasrec_model_outputs_path=None,
                                     experiment_dir=None, results_file_name=None,
                                     add_prob_to_score=False, truncate_continuous_distribution=True,
                                     prob_over_scores=True, approaches=None, top_k_max_size=None,
                                     stopping_rule="full_prefix", write_to_csv=True):
     set_seed(seed)
 
-    results_df = get_top_k_res_from_file(experiment_dir, results_file_name,
+    scores_type = "scores_with_prob" if add_prob_to_score else "equal_scores"
+    fs_models_and_data_path = f"{FIRST_STAGE_MODELS_AND_DATA_MAIN_PATH}{dataset}/seed={seed}/"
+
+    sasrec_model_outputs = None
+    sasrec_rating_head = None
+    sasrec_history_mode = None
+    if first_stage_model_name == "SASRecDist":
+        if sasrec_model_outputs_path is None:
+            raise ValueError("SASRecDist requires sasrec_model_outputs_path")
+
+        data = load_data(fs_models_and_data_path)
+        first_stage_model = None
+        with open(sasrec_model_outputs_path, "rb") as f:
+            sasrec_model_outputs = pickle.load(f)
+
+        sasrec_rating_head = load_exported_rating_head(sasrec_model_outputs, device)
+        sasrec_history_mode = sasrec_model_outputs["history_mode"]
+        if sasrec_history_mode not in {"train", "train_val"}:
+            raise ValueError(f"Invalid SASRec history mode: {sasrec_history_mode}")
+
+        print(f"SASRec loaded with history mode: {sasrec_history_mode}")
+    else:
+        data, first_stage_model = load_first_stage_model_and_data(fs_models_and_data_path,
+                                                                  first_stage_model_name)
+
+    results_experiment_dir = Path(experiment_dir)
+    if first_stage_model_name == "SASRecDist":
+        results_experiment_dir = results_experiment_dir / f"{sasrec_history_mode}_history"
+
+    results_df = get_top_k_res_from_file(results_experiment_dir, results_file_name,
                                          approaches=approaches, top_k_max_size=top_k_max_size)
 
-    scores_type = "scores_with_prob" if add_prob_to_score else "equal_scores"
-    fs_models_and_data_path = f'{FIRST_STAGE_MODELS_AND_DATA_MAIN_PATH}{dataset}/seed={seed}/'
-    data, first_stage_model = load_first_stage_model_and_data(fs_models_and_data_path,
-                                                              first_stage_model_name)
-
     candidate_items_per_user = load_candidate_items_per_user(experiment_dir)
-
 
     unc_thresholds_by_percentiles = None
 
@@ -100,7 +138,21 @@ def run_stopping_from_saved_results(seed=0, dataset="ml-25m", first_stage_model_
     score_distribution_type = MODELS_SCORE_DISTRIBUTION_TYPE[first_stage_model_name]
     dataset_raw_score_values = np.array(POSSIBLE_SCORES[dataset])
     if score_distribution_type == "discrete":
-        score_values = torch.tensor(POSSIBLE_SCORES[dataset])
+        if first_stage_model_name == "SASRecDist":
+            exported_score_values = np.asarray(sasrec_model_outputs["score_labels"])
+            expected_score_values = np.asarray(POSSIBLE_SCORES[dataset])
+
+            if not np.array_equal(exported_score_values, expected_score_values):
+                raise ValueError(
+                    "The SASRec score labels do not match "
+                    "POSSIBLE_SCORES for the dataset. "
+                    f"Exported: {exported_score_values.tolist()}, "
+                    f"expected: {expected_score_values.tolist()}"
+                )
+
+            score_values = torch.as_tensor(exported_score_values)
+        else:
+            score_values = torch.tensor(POSSIBLE_SCORES[dataset])
     elif score_distribution_type == "normal":
         if truncate_continuous_distribution:
             if prob_over_scores:
@@ -123,16 +175,23 @@ def run_stopping_from_saved_results(seed=0, dataset="ml-25m", first_stage_model_
         full_result = list(row["top_k_result"])
 
         base_user_ranking_task = build_base_user_ranking_task(user_id, data, first_stage_model,
-                                                              score_distribution_type, score_values,
+                                                              first_stage_model_name,
+                                                              sasrec_model_outputs,
+                                                              sasrec_rating_head,
+                                                              score_distribution_type,
+                                                              score_values,
                                                               dataset_raw_score_values,
                                                               truncate_continuous_distribution,
-                                                              prob_over_scores, candidate_items_per_user,
-                                                              add_prob_to_score, top_k_max_size)
+                                                              prob_over_scores,
+                                                              candidate_items_per_user,
+                                                              add_prob_to_score,
+                                                              top_k_max_size)
 
         stopping_task = copy.deepcopy(base_user_ranking_task)
         stopping_task.run_rank_dist(scores_type, rd_by_scores=False)
 
-        full_result_item_idxs = [stopping_task.item_ids_to_item_idxs[item_id] for item_id in full_result]
+        full_result_item_idxs = [stopping_task.item_ids_to_item_idxs[item_id]
+                                 for item_id in full_result]
 
         # Compute the exact Precision_C at each t
         prefix_precision_c = []
@@ -230,7 +289,7 @@ def run_stopping_from_saved_results(seed=0, dataset="ml-25m", first_stage_model_
     print("avg improvement vs k_max:", round(stopping_results_df["improvement_vs_k_max"].mean(), 6))
 
     if write_to_csv:
-        stopping_results_path = (Path(experiment_dir) / "results" /
+        stopping_results_path = (results_experiment_dir / "results" /
                                  f"{results_file_name}_stopping_{stopping_rule}.csv")
         stopping_results_df.to_csv(stopping_results_path, index=False)
         print(f"Saved summary results to: {stopping_results_path}")
@@ -250,6 +309,9 @@ def main():
                         choices=ADAPTIVE_APPROACHES)
     parser.add_argument('--top_k_max_size', type=int, default=20)
 
+    # Arg for loading saved SASRec model
+    parser.add_argument("--sasrec_model_outputs_path", type=str, default=None)
+
     parser.add_argument('--stopping_rule', type=str, default="full_prefix",
                         choices=["full_prefix", "marginal_item"])
 
@@ -259,6 +321,7 @@ def main():
         seed=args.seed,
         dataset=args.dataset_name,
         first_stage_model_name=args.fs_model_name,
+        sasrec_model_outputs_path=args.sasrec_model_outputs_path,
         experiment_dir=args.experiment_dir,
         results_file_name=args.results_file_name,
         add_prob_to_score=False,

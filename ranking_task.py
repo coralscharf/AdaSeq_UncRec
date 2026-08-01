@@ -1,6 +1,5 @@
 import math
-from constants import *
-from rank_dist import *
+from rank_dist import RankDist
 from utils import *
 
 
@@ -50,29 +49,10 @@ class UserRankingTask:
 
 
     def set_user_test_data(self, user_test_data):
-        user_test_df = pd.DataFrame(user_test_data, columns=["item", "score"])
-        user_test_df = user_test_df.drop_duplicates(subset=["item"], keep="last")
-        user_test_data = user_test_df.to_numpy()
+        self.user_test_objects = build_user_test_objects(user_test_data)
+        for key, value in self.user_test_objects.items():
+            setattr(self, key, value)
 
-        # ALL test items
-        self.user_test_data = user_test_data
-        self.scores_by_test_items = {
-            int(item_with_score[0]): item_with_score[1]
-            for item_with_score in user_test_data
-        }
-        self.test_item_ids_all = torch.tensor(user_test_data[:, 0]).int()
-        self.test_item_ids_all_as_list = self.test_item_ids_all.tolist()
-
-        # Relevant items with score >= 4
-        self.rel_test_item_ids = torch.tensor(user_test_data[user_test_data[:, 1] >= 4, 0]).int()
-        self.rel_test_item_ids_as_list = self.rel_test_item_ids.tolist()
-
-        # Group ALL test items by rating
-        user_test_data_sorted = user_test_data[user_test_data[:, 1].argsort()]
-        self.test_item_ids_grouped = np.split(user_test_data_sorted[:, 0],
-                                              np.unique(user_test_data_sorted[:, 1],
-                                                        return_index=True)[1][1:])
-        self.test_item_ids_grouped.reverse()
 
     def refresh_current_universe_metadata(self, add_prob_to_score=False):
         self.item_idxs_to_item_ids = {item_idx: item_id.item()
@@ -102,6 +82,8 @@ class UserRankingTask:
             return torch.tensor(norm.sf(PRR_THRESHOLD, self.item_means, self.item_stds))
 
     def get_item_ids_after_ubf(self, percentile, result_size):
+        if self.rec_items_by_preds is None:
+            raise ValueError("uncertainty_based_filtering requires rec_items_by_preds")
         if percentile == 1.0:
             return self.rec_items_by_preds[:result_size].index.tolist()
         else:
@@ -172,12 +154,14 @@ class UserRankingTask:
                 self.item_means = self.item_means[target_item_ids_indices.detach().cpu().numpy()]
                 self.item_stds = self.item_stds[target_item_ids_indices.detach().cpu().numpy()]
 
-            self.rec_items_by_preds = self.rec_items_by_preds[
-                self.rec_items_by_preds.index.isin(set(self.item_ids.tolist()))
-            ]
+            if self.rec_items_by_preds is not None:
+                self.rec_items_by_preds = self.rec_items_by_preds[
+                    self.rec_items_by_preds.index.isin(set(self.item_ids.tolist()))
+                ]
 
         self.refresh_current_universe_metadata(add_prob_to_score=add_prob_to_score)
 
+        # TODO: Consider running update_test_data_by_candidate_items
 
     def set_candidate_items(self, candidate_item_ids, add_prob_to_score):
         """
@@ -208,9 +192,10 @@ class UserRankingTask:
             self.item_means = self.item_means[target_item_ids_indices.detach().cpu().numpy()]
             self.item_stds = self.item_stds[target_item_ids_indices.detach().cpu().numpy()]
 
-        self.rec_items_by_preds = self.rec_items_by_preds[
-            self.rec_items_by_preds.index.isin(set(self.item_ids.tolist()))
-        ]
+        if self.rec_items_by_preds is not None:
+            self.rec_items_by_preds = self.rec_items_by_preds[
+                self.rec_items_by_preds.index.isin(set(self.item_ids.tolist()))
+            ]
 
         self.refresh_current_universe_metadata(add_prob_to_score=add_prob_to_score)
 
@@ -231,23 +216,32 @@ class UserRankingTask:
 
         method = self.score_update_cfg["method"]
         if item_with_feedback and method != "no_update":
-            if self.item_means is None:
-                raise NotImplementedError("global_update is currently implemented only for normal-score models")
-
             next_rec_item_det_score = self.scores_by_test_items[next_rec_item_id]
+
             if method == "local_update":
-                self.apply_similarity_mean_local_update(next_rec_item_id, next_rec_item_det_score)
+                if self.item_means is None:
+                    self.apply_similarity_categorical_local_update(next_rec_item_id,
+                                                                   next_rec_item_det_score)
+                else:
+                    self.apply_similarity_mean_local_update(next_rec_item_id,
+                                                            next_rec_item_det_score)
             elif method == "global_update":
+                if self.item_means is None:
+                    raise NotImplementedError("global_update is currently implemented "
+                                              "only for normal-score models")
+
                 self.apply_user_embedding_global_update(next_rec_item_id, next_rec_item_det_score)
             else:
-                raise ValueError(f"Unsupported global update method: {method}")
+                raise ValueError(f"Unsupported score update method: {method}")
 
-            self.item_score_distributions = (
-                create_items_discrete_distribution_from_normal_distribution(
-                    self.item_means, self.item_stds, self.raw_score_values_for_rebuild,
-                    self.truncate_continuous_distribution, self.prob_over_scores
-                )
-            ).to(device)
+            # Gaussian models must rebuild their discretized distributions after updating the means.
+            if self.item_means is not None:
+                self.item_score_distributions = (
+                    create_items_discrete_distribution_from_normal_distribution(
+                        self.item_means, self.item_stds, self.raw_score_values_for_rebuild,
+                        self.truncate_continuous_distribution, self.prob_over_scores,
+                    )
+                ).to(device)
 
         if not do_not_change_rd_uni: # Universe Updating
             keep_mask = (self.item_ids != next_rec_item_id)
@@ -260,9 +254,10 @@ class UserRankingTask:
                 self.item_means = self.item_means[keep_indices]
                 self.item_stds = self.item_stds[keep_indices]
 
-            self.rec_items_by_preds = self.rec_items_by_preds[
-                self.rec_items_by_preds.index.isin(set(self.item_ids.detach().cpu().tolist()))
-            ]
+            if self.rec_items_by_preds is not None:
+                self.rec_items_by_preds = self.rec_items_by_preds[
+                    self.rec_items_by_preds.index.isin(set(self.item_ids.detach().cpu().tolist()))
+                ]
 
             self.refresh_current_universe_metadata(add_prob_to_score=False)
 
@@ -414,25 +409,5 @@ class UserRankingTask:
 
 
     def compute_exact_metrics(self, top_k_result):
-        metric_results = dict()
-        metric_results['precision_l'] = compute_precision(top_k_result,
-                                                          self.rel_test_item_ids_as_list,
-                                                          self.test_item_ids_grouped,
-                                                          reference="all_test_items")
-        metric_results['precision_c'] = compute_precision(top_k_result,
-                                                          self.rel_test_item_ids_as_list,
-                                                          self.test_item_ids_grouped,
-                                                          reference="k_ranked_test_items")
-
-        metric_results['dcg_l'] = compute_dcg_for_user(self.scores_by_test_items,
-                                                       self.test_item_ids_grouped,
-                                                       top_k_result,
-                                                       dcg_version='liberal')
-        metric_results['dcg_c'] = compute_dcg_for_user(self.scores_by_test_items,
-                                                       self.test_item_ids_grouped,
-                                                       top_k_result,
-                                                       dcg_version='conservative')
-
-        metric_results['recall'] = compute_recall(top_k_result, self.rel_test_item_ids_as_list)
-        return metric_results
+        return compute_exact_metrics_for_user(top_k_result, self.user_test_objects)
 
